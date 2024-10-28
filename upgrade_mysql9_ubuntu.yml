@@ -1,0 +1,160 @@
+---
+
+- name: Upgrade Freeswitch mysql on Ubuntu 22.04
+  when: servertype in ('freeswitch') and ansible_distribution == 'Ubuntu' and ansible_distribution_version == '22.04'
+  block:
+
+    - name: Restart service keepalived make FIP failover to peer
+      service:
+        name: keepalived
+        state: restarted
+      ignore_errors: True
+
+    ## How to fix mysql_native_password https://php.watch/articles/fix-php-mysql-84-mysql_native_password-not-loaded
+    - name: Get MySQL Users using mysql_native_password
+      shell: echo "SELECT user, host, plugin from mysql.user WHERE plugin='mysql_native_password';" | isql -vb freeswitch root
+      ignore_errors: True
+
+    - name: Print MySQL Users using mysql_native_password
+      debug:
+        msg: "{{ user_output.stdout }}"
+      ignore_errors: True
+
+    - name: Get server hostname
+      command: hostname
+      register: hostname_output
+
+    - name: Update mysql_native_password users to caching_sha2_password
+      shell: echo "ALTER USER 'root'@'{{ item }}' IDENTIFIED WITH caching_sha2_password BY '{{ FS_DB_PWD }}';" | isql -vb freeswitch root
+      loop:
+        - "%"
+        - "127.0.0.1"
+        - "::1"
+        - "localhost"
+        - "{{ hostname_output.stdout }}"
+      ignore_errors: True
+
+    - name: Get MySQL Users using caching_sha2_password
+      shell: echo "SELECT user, host, plugin from mysql.user WHERE plugin='caching_sha2_password';" | isql -vb freeswitch root
+      register: user_output
+      ignore_errors: True
+
+    - name: Print MySQL Users using caching_sha2_password
+      debug:
+        msg: "{{ user_output.stdout }}"
+
+    - name: Backup mysql files
+      copy:
+        src: "{{ item.source }}"
+        dest: "{{ item.dest }}"
+        remote_src: yes
+      loop:
+        - { source: "/etc/mysql/mysql.conf.d/mysqld.cnf", dest: "/etc/mysql/mysql.conf.d/mysqld.cnf.bak" }
+        - { source: "/etc/mysql/mysql.cnf", dest: "/etc/mysql/mysql.cnf.bak" }
+        - { source: "/etc/odbcinst.ini", dest: "/etc/odbcinst.ini.bak" }
+
+    - name: Create mysql9 directory
+      file:
+        path: /tmp/mysql9
+        state: directory
+        mode: '0755'
+
+      # https://dev.mysql.com/downloads/mysql/
+      # https://dev.mysql.com/downloads/connector/odbc/
+      # 1. Select mysql version
+      # 2. Ubuntu Linux / Oracle Linux
+      # 3. Ubuntu Linux 22.04 (x86, 64-bit)
+    - name:  Download new mysql bundle tar and ODBC deb files
+      shell: wget --inet4-only "{{ item.url }}" -P "{{ item.path }}"
+      loop:
+        - { url: "https://dev.mysql.com/get/Downloads/MySQL-9.0/mysql-server_9.0.1-1ubuntu22.04_amd64.deb-bundle.tar", path: "/tmp/" }
+        - { url: "https://dev.mysql.com/get/Downloads/Connector-ODBC/9.0/mysql-connector-odbc_9.0.0-1ubuntu22.04_amd64.deb", path: "/tmp/mysql9" }
+
+    - name: Unarchive mysql bundle
+      unarchive:
+        src: /tmp/{{ item }}
+        dest: /tmp/mysql9
+        remote_src: yes
+      loop:
+        - mysql-server_9.0.1-1ubuntu22.04_amd64.deb-bundle.tar
+
+    - name: Remove the old mysql package without removing any dependencies
+      shell: dpkg --get-selections | grep mysql | grep -v deinstall | awk '{print $1}' | xargs dpkg --remove
+      ignore_errors: True
+
+    - name: Install new mysql packages
+      shell: dpkg -i "{{ item }}"
+      loop:
+        # Install order important otherwise you get dependancy errors
+        - /tmp/mysql9/mysql-common_9.0.1-1ubuntu22.04_amd64.deb
+        - /tmp/mysql9/mysql-community-client-plugins_9.0.1-1ubuntu22.04_amd64.deb
+        - /tmp/mysql9/mysql-community-client-core_9.0.1-1ubuntu22.04_amd64.deb
+        - /tmp/mysql9/mysql-community-client_9.0.1-1ubuntu22.04_amd64.deb
+        - /tmp/mysql9/mysql-client_9.0.1-1ubuntu22.04_amd64.deb
+        - /tmp/mysql9/mysql-community-server-core_9.0.1-1ubuntu22.04_amd64.deb
+        - /tmp/mysql9/mysql-connector-odbc_9.0.0-1ubuntu22.04_amd64.deb
+
+      # Installing mysql-community-server will prompt this, use 'N' selection by passing flag --force-conhold
+      # Configuration file '/etc/mysql/mysql.conf.d/mysqld.cnf'
+      #  ==> Modified (by you or by a script) since installation.
+      #  ==> Package distributor has shipped an updated version.
+      #    What would you like to do about it ?  Your options are:
+      #     Y or I  : install the package maintainer's version
+      #     N or O  : keep your currently-installed version
+      #       D     : show the differences between the versions
+      #       Z     : start a shell to examine the situation
+      #  The default action is to keep your current version.
+      # *** mysqld.cnf (Y/I/N/O/D/Z) [default=N] ?
+    - name: Install mysql-community-server with flag '--force-confold'
+      shell: DEBIAN_FRONTEND=noninteractive dpkg -i --force-confold /tmp/mysql9/mysql-community-server_9.0.1-1ubuntu22.04_amd64.deb
+
+    - name: Search replace libmyodbc8w.so -> libmyodbc9w.so in file /etc/odbcinst.ini
+      lineinfile:
+        path: /etc/odbcinst.ini
+        search_string: 'DRIVER=/usr/lib/x86_64-linux-gnu/odbc/libmyodbc8w.so'
+        line: 'DRIVER=/usr/lib/x86_64-linux-gnu/odbc/libmyodbc9w.so'
+
+    - name: Add line '!includedir /etc/mysql/mysql.conf.d/' to /etc/mysql/my.cnf
+      lineinfile:
+        path: /etc/mysql/my.cnf
+        line: '!includedir /etc/mysql/mysql.conf.d/'
+
+    - name: Comment out mysql_native_password=ON in /etc/mysql/mysql.conf.d/mysqld.cnf
+      lineinfile:
+        path: /etc/mysql/mysql.conf.d/mysqld.cnf
+        search_string: 'mysql_native_password=ON'
+        line: '#mysql_native_password=ON'
+
+    - name: Restart service mysql (can take 30s)
+      service:
+        name: mysql
+        state: restarted
+
+    - name: Get mysqld version
+      shell: /sbin/mysqld -V
+      register: mysqld_output
+
+    - name: Print mysqld version
+      debug:
+        msg: "{{ mysqld_output.stdout }}"
+
+    - name: Get mysql deb versions
+      shell: dpkg -l | grep mysql | awk '{print $2"\t\t"$3}'
+      register: deb_output
+
+    - name: Print mysql versions
+      debug:
+        msg: "{{ deb_output.stdout }}"
+
+    - name: Restart Freeswitch service
+      service:
+        name: freeswitch
+        state: restarted
+
+    - name: Cleanup mysql download files
+      file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /tmp/mysql9
+        - /tmp/mysql-server_9.0.1-1ubuntu22.04_amd64.deb-bundle.tar
