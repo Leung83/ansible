@@ -1,0 +1,77 @@
+---
+
+- hosts: glb_zmsvr
+  gather_facts: no
+  become: yes
+  vars:
+    java_version: "jdk-17.0.8"
+
+  tasks:
+    - name: Upgrade java jdk for Linux
+      block:
+          # https://www.oracle.com/java/technologies/downloads/
+          # 1. Select JDK 17
+          # 2. Linux
+        - name:  Download new java jdk
+          shell: wget "{{ item }}" -P /tmp/
+          with_items:
+            - https://download.oracle.com/java/17/archive/{{ java_version }}_linux-x64_bin.tar.gz
+
+        - name: Extract java jdk
+          unarchive:
+            src: /tmp/{{ java_version }}_linux-x64_bin.tar.gz
+            dest: /tmp/
+            remote_src: yes
+
+        - name: Rename new java folder to /tmp/jdk
+          command: mv /tmp/{{ java_version }} /tmp/jdk
+
+        - name: Remove old java folder
+          file:
+            path: /usr/local/jdk
+            state: absent
+
+        - name: Move new java from /tmp/jdk to /usr/local/jdk
+          command: mv /tmp/jdk /usr/local/
+
+        - name: Execute java config commands
+          shell: |
+            chmod -R 755 /usr/local/jdk
+            chrpath -r /usr/local/jdk/lib/ /usr/local/jdk/bin/java
+            setcap 'cap_net_bind_service=+ep' /usr/local/jdk/bin/java
+
+        - name: Load profile and get java version
+          shell: |
+            source /etc/profile
+            java --version
+          register: java_output
+
+        - name: Print java version
+          debug:
+            msg: "{{ java_output.stdout_lines }}"
+
+        - name: Restart service tomcat to use new java version
+          service:
+            name: tomcat
+            state: restarted
+
+        - name: Parse tomcat logs
+          shell: tail -1000 /opt/apache-tomcat-*/logs/catalina.out | grep -B5 -A3 "Java Home:"
+          register: tomcat_output
+
+        - name: Print tomcat logs to verify new java version
+          debug:
+            msg: "{{ tomcat_output.stdout_lines }}"
+
+        - name: Curl tspadaptor status page
+          uri:
+            url: https://{{ ansible_host }}/zoomadaptor/healthcheck.action
+            validate_certs: false
+            return_content: true
+          register: curl_output
+
+        - name: Print tspadaptor status page output
+          debug:
+            msg: "{{ curl_output.content }}"
+
+      when: servertype in ('tspadaptor')
