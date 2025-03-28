@@ -1,0 +1,163 @@
+  # How to execute:
+  # ansible-playbook rekick_server.yml -i zmhosts/ -l $IP
+  #
+  # Rollback:
+  # ansible-playbook rekick_server.yml -i zmhosts/ -l $IP -t rollback_rekick_prep
+  # -t attach      = attach CSMS role to server
+
+  - hosts: glb_zmsvr
+    gather_facts: yes
+    become: yes
+    tasks:
+      - name: Prep server for re-kick
+        when: ansible_distribution == 'Ubuntu'
+        block:
+
+          - name: Get list of myapp systemd services
+            shell: cd /etc/systemd/system; grep -i 'User=myapp' *.service 2>/dev/null | awk -F':' '{print $1}' | uniq
+            register: services_output
+
+          - debug: msg="{{ services_output.stdout_lines }}"
+
+          - name: Confirm you want to Stop/Disable/Mask services listed above?
+            pause:
+              prompt: (yes/no)
+            register: input
+            run_once: true
+            delegate_to: localhost
+
+          - name: Check if user wants to proceed
+            fail:
+              msg: "User chose not to proceed. Exiting playbook."
+            when: input.user_input | lower != 'yes'
+            run_once: true
+            delegate_to: localhost
+
+          # Mask will not work if unit file is stored in /etc/systemd/system/
+          - name: Stop/Disable/Mask myapp services
+            systemd_service:
+              name: "{{ item }}"
+              state: stopped
+              enabled: false
+              masked: true
+            loop: "{{ services_output.stdout_lines }}"
+
+          - name: Stop/Disable/Mask keepalived service (only webapp)
+            systemd_service:
+              name: keepalived
+              state: stopped
+              enabled: false
+              masked: true
+            when: servertype is match('^(webapp)$')
+
+          - name: "Find /etc/cron.d/restartservice*"
+            find:
+              paths: /etc/cron.d/
+              patterns: 'restartservice*'
+              recurse: no
+            register: restart_files
+            ignore_errors: True
+
+          - name: Comment out cron jobs /etc/cron.d/restartservice*
+            shell: sed -i '1s/^/###/' {{ item.path }}
+            with_items:
+              - "{{ restart_files.files }}"
+            ignore_errors: True
+
+          - name: "Find /etc/cron.d/uplo*"
+            find:
+              paths: /etc/cron.d/
+              patterns: 'uplo*'
+              recurse: no
+            register: upload_files
+
+          - name: Comment out cron jobs /etc/cron.d/uplo*
+            shell: sed -i '1s/^/###/' {{ item.path }}
+            with_items:
+              - "{{ upload_files.files }}"
+            ignore_errors: True  
+
+          - name: "Find /etc/cron.d/*guard"
+            find:
+              paths: /etc/cron.d/
+              patterns: '*guard'
+              recurse: no
+            register: guard_files
+            ignore_errors: True
+
+          - name: Comment out cron jobs /etc/cron.d/*guard
+            shell: sed -i '1s/^/###/' {{ item.path }}
+            with_items:
+              - "{{ guard_files.files }}"
+            ignore_errors: True  
+
+
+    ############ Rollback #############
+      - name: Rollback rekick prep
+        tags: rollback_rekick_prep
+        block:
+          - name: Start/Enable/Unmask keepalived service (only webserver)
+            systemd_service:
+              name: keepalived
+              state: started
+              enabled: true
+              masked: false
+            when: servertype is match('^(webserver))$')
+
+          # - name: Attach server role using CSMS
+          #   shell: bash /opt/ssb/jwt-attachroleV4.2.sh -e prod -p {{ csms_path }} -t {{ jwt_key | default('dummy') }}
+          #   ignore_errors: True
+          #   tags: attach
+
+          - name: "Find /etc/cron.d/restartservice*"
+            find:
+              paths: /etc/cron.d/
+              patterns: 'restartservice*'
+              recurse: no
+            register: restart_files
+
+          - name: Uncomment cron jobs /etc/cron.d/restartservice*
+            shell: sed -i 's/###//g' {{ item.path }}
+            with_items:
+              - "{{ restart_files.files }}"
+            ignore_errors: True
+
+          - name: "Find /etc/cron.d/uplo*"
+            find:
+              paths: /etc/cron.d/
+              patterns: 'uplo*'
+              recurse: no
+            register: upload_files
+
+          - name: Uncomment cron jobs /etc/cron.d/uplo*
+            shell: sed -i 's/###//g' {{ item.path }}
+            with_items:
+              - "{{ upload_files.files }}"
+            ignore_errors: True
+
+          - name: "Find /etc/cron.d/*guard"
+            find:
+              paths: /etc/cron.d/
+              patterns: '*guard'
+              recurse: no
+            register: guard_files
+
+          - name: Uncomment cron jobs /etc/cron.d/*guard
+            shell: sed -i 's/###//g' {{ item.path }}
+            with_items:
+              - "{{ guard_files.files }}"
+            ignore_errors: True
+
+          - name: Get list of myapp systemd services
+            shell: cd /etc/systemd/system; grep -i 'User=myapp' *.service 2>/dev/null | awk -F':' '{print $1}' | uniq
+            register: services_output
+
+          # - debug: msg="{{ services_output.stdout_lines }}"
+
+          - name: Start/Enable/Unmask myapp services
+            systemd_service:
+              name: "{{ item }}"
+              state: started
+              enabled: true
+              masked: false
+            loop: "{{ services_output.stdout_lines }}"
