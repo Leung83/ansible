@@ -1,0 +1,35 @@
+---
+- name: Generate CSV file with group variables
+  hosts: all
+  gather_facts: no
+  tasks:
+    - name: Initialize CSV file with header ~/Downloads/rebooter_inventory.csv
+      copy:
+        dest: ~/Downloads/rebooter_inventory.csv
+        content: "instance_id,teleport_instance_id,labels\n"
+      delegate_to: localhost
+      run_once: true
+
+    - name: Append group variables to CSV file ~/Downloads/rebooter_inventory.csv
+      lineinfile:
+        path: ~/Downloads/rebooter_inventory.csv
+        line: >
+          {{ inventory_hostname }},
+          {{ inventory_hostname }},
+          "{{ {
+            'servertype':hostvars[inventory_hostname].servertype | default('N/A'),
+            'MMZ':hostvars[inventory_hostname].MMZ | default('N/A')
+          } }}"
+        create: yes
+      delegate_to: localhost
+
+    - name: Fix formatting in CSV file ~/Downloads/rebooter_inventory.csv
+      replace:
+        path: ~/Downloads/rebooter_inventory.csv
+        regexp: "{{ item.regexp }}"
+        replace: "{{ item.replace }}"
+      loop:
+        - { regexp: "'", replace: '""' }  # Replace single quotes with double quotes
+        - { regexp: " ", replace: "" }    # Remove all whitespaces
+      delegate_to: localhost
+      run_once: true
